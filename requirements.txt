@@ -5,3 +5,6 @@ python-dotenv
 langchain-groq
 langchain_tavily
 ipython
+streamlit
+fastapi
+uvicorn

@@ -1,28 +1,3 @@
-
-# --- Download Markdown Content Endpoint ---
-from fastapi.responses import StreamingResponse
-
-@app.get("/api/v1/articles/download-markdown")
-async def download_article_markdown():
-    """
-    Download the latest generated markdown content as a file.
-    """
-    # Find the most recent completed job with markdown_content or final_article
-    completed_jobs = [job for job in jobs.values() if job.get("status") == JobStatus.COMPLETED]
-    if not completed_jobs:
-        raise HTTPException(status_code=404, detail="No completed article found for download.")
-    # Sort by created_at descending
-    completed_jobs.sort(key=lambda x: x["created_at"], reverse=True)
-    job = completed_jobs[0]
-    # Prefer markdown_content, fallback to final_article or article
-    content = job.get("markdown_content") or job.get("final_article") or job.get("article")
-    if not content:
-        raise HTTPException(status_code=404, detail="No article content available for download.")
-    return StreamingResponse(
-        iter([content]),
-        media_type="text/markdown",
-        headers={"Content-Disposition": "attachment; filename=final.md"}
-    )
 import os
 import sys
 from typing import Dict, Literal, Optional, List
@@ -36,7 +11,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 
 # FastAPI imports
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from enum import Enum
@@ -83,12 +58,6 @@ def search_web(query: str) -> Dict:
         "summary": "\n\n".join(summaries).strip(),
         "links": [link for link in links if link]
     }
-
-
-# --- Tool: Save to Markdown ---
-@tool
-
-
 
 
 # --- Supervisor Agent (LLM-powered) ---
@@ -222,6 +191,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
 
 # --- File Writer Agent ---
+def file_writer_agent(state: SupervisorState) -> Dict:
     print("💾 File Writer is preparing the markdown content...")
     # If final_article is empty, fallback to article
     final_content = state.get("final_article") or state.get("article") or ""
@@ -231,6 +201,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
         "next_agent": "end",
         "task_complete": True
     }
+
 
 
 # --- Router ---
@@ -420,6 +391,29 @@ async def health_check():
         llm_model=llm_model_name or "unknown"
     )
 
+
+# --- Download Markdown Content Endpoint ---
+@app.get("/api/v1/articles/download-markdown")
+async def download_article_markdown():
+    """
+    Download the latest generated markdown content as a file.
+    """
+    # Find the most recent completed job with markdown_content or final_article
+    completed_jobs = [job for job in jobs.values() if job.get("status") == JobStatus.COMPLETED]
+    if not completed_jobs:
+        raise HTTPException(status_code=404, detail="No completed article found for download.")
+    # Sort by created_at descending
+    completed_jobs.sort(key=lambda x: x["created_at"], reverse=True)
+    job = completed_jobs[0]
+    # Prefer markdown_content, fallback to final_article or article
+    content = job.get("markdown_content") or job.get("final_article") or job.get("article")
+    if not content:
+        raise HTTPException(status_code=404, detail="No article content available for download.")
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/markdown",
+        headers={"Content-Disposition": "attachment; filename=final.md"}
+    )
 
 
 # --- Direct Article Generation Endpoint ---
