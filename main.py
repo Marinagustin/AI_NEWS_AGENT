@@ -1,3 +1,4 @@
+
 import os
 import sys
 from typing import Dict, Literal, Optional, List
@@ -27,6 +28,10 @@ llm_model_name = os.getenv("LLM_MODEL_NAME")
 llm = init_chat_model(llm_model_name)
 print("✅ LLM initialized")
 
+# Create output directory for markdown files
+OUTPUT_DIR = "generated_articles"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 # =============================================================================
 # AGENT WORKFLOW CODE
@@ -40,7 +45,9 @@ class SupervisorState(MessagesState):
     references: list[str] = []
     article: str = ""
     final_article: str = ""
+    markdown_content: str = ""
     task_complete: bool = False
+    file_path: str = ""  # NEW: Store the file path
 
 
 # --- Tool: Web Search ---
@@ -58,6 +65,51 @@ def search_web(query: str) -> Dict:
         "summary": "\n\n".join(summaries).strip(),
         "links": [link for link in links if link]
     }
+
+
+# --- NEW: File Writer Tool ---
+@tool
+def file_writer_tool(content: str, topic: str) -> Dict:
+    """
+    Save the final article content to a markdown file.
+    
+    Args:
+        content: The article content to save
+        topic: The topic of the article (used for filename)
+    
+    Returns:
+        Dict with status and file_path
+    """
+    try:
+        # Create a safe filename from the topic
+        safe_topic = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in topic)
+        safe_topic = safe_topic.replace(' ', '_')[:50]  # Limit length
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{safe_topic}_{timestamp}.md"
+        file_path = os.path.join(OUTPUT_DIR, filename)
+        
+        # Write content to file
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        print(f"✅ Article saved to: {file_path}")
+        
+        return {
+            "status": "success",
+            "file_path": file_path,
+            "filename": filename,
+            "message": f"Article successfully saved to {filename}"
+        }
+    except Exception as e:
+        print(f"❌ Error saving file: {str(e)}")
+        return {
+            "status": "error",
+            "file_path": "",
+            "filename": "",
+            "message": f"Failed to save file: {str(e)}"
+        }
 
 
 # --- Supervisor Agent (LLM-powered) ---
@@ -78,15 +130,17 @@ Topic: {state.get('topic','')}
 Research Summary: {bool(state.get('research_summary'))}
 Article: {bool(state.get('article'))}
 Final Article: {bool(state.get('final_article'))}
+File Path: {state.get('file_path', '')}
 
 Instructions:
 - If research_summary is missing, assign researcher.
 - If article is missing, assign writer.
 - If final_article is missing, assign editor.
-- If all are present, assign file_writer and mark task_complete.
+- If file_path is missing, assign file_writer.
+- If all are present including file_path, mark task_complete and assign end.
 - Only one agent should be assigned at a time.
 
-Reply with the next agent to act (one of: researcher, analyst, writer, editor, file_writer, end) and a short message for the log.
+Reply with the next agent to act (one of: researcher, writer, editor, file_writer, end) and a short message for the log.
 Format:
 next_agent: <agent_name>
 message: <short message>
@@ -105,16 +159,17 @@ task_complete: <true/false>
         elif line.lower().startswith("task_complete:"):
             val = line.split(":",1)[1].strip().lower()
             task_complete = val == "true"
-    # Map 'end' to file_writer for graph logic
-    if next_agent == "end":
+    
+    # If we have final_article but no file_path, go to file_writer
+    if state.get('final_article') and not state.get('file_path'):
         next_agent = "file_writer"
-        task_complete = True
+        task_complete = False
+    
     return {
         "messages": [AIMessage(content=message)],
         "next_agent": next_agent,
         "task_complete": task_complete
     }
-
 
 
 # --- Researcher Agent (factual persona) ---
@@ -190,28 +245,49 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
     }
 
 
-# --- File Writer Agent ---
+# --- File Writer Agent (UPDATED) ---
 def file_writer_agent(state: SupervisorState) -> Dict:
-    print("💾 File Writer is preparing the markdown content...")
-    # If final_article is empty, fallback to article
+    print("💾 File Writer agent is working...")
+    # Get the final content
     final_content = state.get("final_article") or state.get("article") or ""
+    
+    if not final_content:
+        return {
+            "messages": [AIMessage(content="⚠️ File Writer: No content to save.")],
+            "markdown_content": "",
+            "file_path": "",
+            "next_agent": "end",
+            "task_complete": True
+        }
+    
+    # Use the file_writer_tool to save the file
+    result = file_writer_tool.invoke({
+        "content": final_content,
+        "topic": state.get("topic", "article")
+    })
+    
     return {
-        "messages": [AIMessage(content="💾 File Writer: Markdown content ready.")],
+        "messages": [AIMessage(content=f"💾 File Writer: {result.get('message', 'File saved.')}")],
         "markdown_content": final_content,
+        "file_path": result.get("file_path", ""),
         "next_agent": "end",
         "task_complete": True
     }
-
 
 
 # --- Router ---
 def router(state: SupervisorState) -> Literal[
     "supervisor", "researcher", "writer", "editor", "file_writer", "__end__"
 ]:
-    if state.get("task_complete"):
+    if state.get("task_complete") and state.get("file_path"):
         return END
-    return state.get("next_agent", "supervisor")
-
+    # Always ensure file_writer runs before ending
+    next_agent = state.get("next_agent", "supervisor")
+    if next_agent == "end" and not state.get("file_path"):
+        return "file_writer"
+    if next_agent == "end":
+        return END
+    return next_agent
 
 
 # --- Workflow Graph ---
@@ -303,6 +379,7 @@ class ArticleResponse(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     markdown_content: Optional[str] = None
+    file_path: Optional[str] = None  # NEW: Include file path
 
 
 class HealthResponse(BaseModel):
@@ -343,13 +420,15 @@ async def run_agent_workflow(job_id: str, topic: str):
             }
         )
         
-        # Update job with results
+        # Update job with results, including file_path
         update_job_status(
             job_id,
             JobStatus.COMPLETED,
             article=result.get("final_article", ""),
             research_summary=result.get("research_summary", ""),
             references=result.get("references", []),
+            markdown_content=result.get("markdown_content", result.get("final_article", "")),
+            file_path=result.get("file_path", ""),
             completed_at=datetime.now()
         )
         
@@ -378,9 +457,6 @@ async def root():
     )
 
 
-
-
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Detailed health check"""
@@ -392,23 +468,35 @@ async def health_check():
     )
 
 
-# --- Download Markdown Content Endpoint ---
+# --- Download Markdown Content Endpoint (UPDATED) ---
 @app.get("/api/v1/articles/download-markdown")
 async def download_article_markdown():
     """
     Download the latest generated markdown content as a file.
     """
-    # Find the most recent completed job with markdown_content or final_article
+    # Find the most recent completed job with file_path
     completed_jobs = [job for job in jobs.values() if job.get("status") == JobStatus.COMPLETED]
     if not completed_jobs:
         raise HTTPException(status_code=404, detail="No completed article found for download.")
+    
     # Sort by created_at descending
     completed_jobs.sort(key=lambda x: x["created_at"], reverse=True)
     job = completed_jobs[0]
-    # Prefer markdown_content, fallback to final_article or article
+    
+    # Get file path
+    file_path = job.get("file_path")
+    if file_path and os.path.exists(file_path):
+        return FileResponse(
+            path=file_path,
+            media_type="text/markdown",
+            filename=os.path.basename(file_path)
+        )
+    
+    # Fallback to content
     content = job.get("markdown_content") or job.get("final_article") or job.get("article")
     if not content:
         raise HTTPException(status_code=404, detail="No article content available for download.")
+    
     return StreamingResponse(
         iter([content]),
         media_type="text/markdown",
@@ -416,12 +504,14 @@ async def download_article_markdown():
     )
 
 
-# --- Direct Article Generation Endpoint ---
+from fastapi import Request
+
+# --- Direct Article Generation Endpoint (UPDATED for UI) ---
 @app.post("/api/v1/articles/generate", response_model=ArticleResponse, status_code=200)
 async def generate_article_direct(request: ArticleRequest):
     """
     Generate a news article based on the provided topic.
-    Returns the article and related data directly.
+    Returns the article, markdown content, and download URL for UI.
     """
     created_at = datetime.now()
     try:
@@ -438,33 +528,55 @@ async def generate_article_direct(request: ArticleRequest):
             }
         )
 
-
-
         completed_at = datetime.now()
-        return ArticleResponse(
-            status=JobStatus.COMPLETED,
-            topic=request.topic,
-            article=result.get("final_article", ""),
-            research_summary=result.get("research_summary", ""),
-            references=result.get("references", []),
-            created_at=created_at,
-            completed_at=completed_at,
-            error=None,
-            markdown_content=result.get("final_article", "")
-        )
+        # Build download URL if file_path exists
+        file_path = result.get("file_path", "")
+        filename = os.path.basename(file_path) if file_path else None
+        download_url = f"/api/v1/articles/download/{filename}" if filename else None
+
+        # Return markdown_content and download_url for UI
+        return {
+            "status": JobStatus.COMPLETED,
+            "topic": request.topic,
+            "article": result.get("final_article", ""),
+            "research_summary": result.get("research_summary", ""),
+            "references": result.get("references", []),
+            "created_at": created_at,
+            "completed_at": completed_at,
+            "error": None,
+            "markdown_content": result.get("markdown_content", result.get("final_article", "")),
+            "file_path": file_path,
+            "download_url": download_url
+        }
     except Exception as e:
         print(f"❌ Direct workflow failed: {str(e)}")
-        return ArticleResponse(
-            status=JobStatus.FAILED,
-            topic=request.topic,
-            article=None,
-            research_summary=None,
-            references=None,
-            created_at=created_at,
-            completed_at=datetime.now(),
-            error=str(e),
-            markdown_content=None
+        return {
+            "status": JobStatus.FAILED,
+            "topic": request.topic,
+            "article": None,
+            "research_summary": None,
+            "references": None,
+            "created_at": created_at,
+            "completed_at": datetime.now(),
+            "error": str(e),
+            "markdown_content": None,
+            "file_path": None,
+            "download_url": None
+        }
+# --- Download Specific Markdown File Endpoint ---
+@app.get("/api/v1/articles/download/{filename}")
+async def download_specific_markdown(filename: str):
+    """
+    Download a specific markdown file by filename from the generated_articles directory.
+    """
+    file_path = os.path.join(OUTPUT_DIR, filename)
+    if os.path.exists(file_path):
+        return FileResponse(
+            path=file_path,
+            media_type="text/markdown",
+            filename=filename
         )
+    raise HTTPException(status_code=404, detail="File not found.")
 
 
 @app.get("/api/v1/articles/status/{job_id}", response_model=ArticleResponse)
@@ -586,6 +698,8 @@ if __name__ == "__main__":
             "messages": [HumanMessage(content=topic)]
         })
         print("\n" + result.get("final_article", "No article generated."))
+        if result.get("file_path"):
+            print(f"\n✅ Article saved to: {result.get('file_path')}")
         
     else:
         # API mode
@@ -595,6 +709,7 @@ if __name__ == "__main__":
         print(f"🚀 Starting server on http://{args.host}:{args.port}")
         print(f"📚 API Documentation: http://{args.host}:{args.port}/docs")
         print(f"📖 ReDoc: http://{args.host}:{args.port}/redoc")
+        print(f"📁 Articles saved to: {os.path.abspath(OUTPUT_DIR)}")
         print("="*60 + "\n")
         
         uvicorn.run(
