@@ -1,4 +1,3 @@
-
 import os
 import sys
 from typing import Dict, Literal, Optional, List
@@ -20,6 +19,9 @@ import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import uvicorn
+
+from app.workflow import graph
+from app.agents import supervisor_agent, researcher_agent, writer_agent, editor_agent, file_writer_agent
 
 load_dotenv()
 
@@ -115,7 +117,7 @@ def file_writer_tool(content: str, topic: str) -> Dict:
 # --- Supervisor Agent (LLM-powered) ---
 def supervisor_agent(state: SupervisorState) -> Dict:
     print("👔 Supervisor is reviewing the workflow...")
-    # Compose a prompt for the LLM to decide the next agent
+    # Compose a prompt for the LLM to decide which agent should act next
     prompt = f"""
 You are the supervisor of a multi-agent news workflow. Based on the current state, decide which agent should act next.
 
@@ -529,12 +531,7 @@ async def generate_article_direct(request: ArticleRequest):
         )
 
         completed_at = datetime.now()
-        # Build download URL if file_path exists
         file_path = result.get("file_path", "")
-        filename = os.path.basename(file_path) if file_path else None
-        download_url = f"/api/v1/articles/download/{filename}" if filename else None
-
-        # Return markdown_content and download_url for UI
         return {
             "status": JobStatus.COMPLETED,
             "topic": request.topic,
@@ -545,8 +542,7 @@ async def generate_article_direct(request: ArticleRequest):
             "completed_at": completed_at,
             "error": None,
             "markdown_content": result.get("markdown_content", result.get("final_article", "")),
-            "file_path": file_path,
-            "download_url": download_url
+            "file_path": file_path
         }
     except Exception as e:
         print(f"❌ Direct workflow failed: {str(e)}")
@@ -560,9 +556,10 @@ async def generate_article_direct(request: ArticleRequest):
             "completed_at": datetime.now(),
             "error": str(e),
             "markdown_content": None,
-            "file_path": None,
-            "download_url": None
+            "file_path": None
         }
+
+
 # --- Download Specific Markdown File Endpoint ---
 @app.get("/api/v1/articles/download/{filename}")
 async def download_specific_markdown(filename: str):
